@@ -1,0 +1,139 @@
+# -*- coding: utf-8 -*-
+from __future__ import print_function
+import os, sys, csv
+from odbAccess import openOdb
+from abaqusConstants import *
+import xyPlot
+
+# ---- USER INPUTS -------------------------------------------------------------
+odb_directory   = r"D:\2024-2025 Thin Film Scan Spherical\Spherical ML Thin Film Modeling\6th Hard + Soft Properties Mix\Bulk 6th Pro 1-1700 Depth 400nm"
+num_odb_files   = 440
+step_name       = "Step-1"
+
+# Use only RF2 by default (recommended for indentation). Set to True to sum RF1+RF2+RF3.
+SUM_ALL_COMPONENTS = False
+RF_COMPONENTS  = ('RF1','RF2','RF3') if SUM_ALL_COMPONENTS else ('RF2',)
+
+# Displacement probe (instance name must match exactly as in the ODB, case-sensitive)
+INSTANCE_NAME   = "brkovich small-1"
+NODE_LABEL      = 261
+DISP_COMPONENT  = 'U2'
+ROUND_T         = 12
+
+csv_subfolder   = "force_disp_csv"
+png_subfolder   = "force_disp_png"
+# -----------------------------------------------------------------------------
+
+def py3():
+    return sys.version_info[0] >= 3
+
+def open_csv(path):
+    if py3():
+        return open(path, 'w', newline='')
+    else:
+        return open(path, 'wb')
+
+def extract_total_reaction(odb, step_name, rf_components):
+    step = odb.steps[step_name]
+    acc = {}
+    for region_name, region in step.historyRegions.items():
+        for comp in rf_components:
+            if comp in region.historyOutputs:
+                for t, val in region.historyOutputs[comp].data:
+                    tt = round(t, ROUND_T)
+                    acc[tt] = acc.get(tt, 0.0) + val
+    ts = sorted(acc.keys())
+    return ts, [acc[t] for t in ts]
+
+def extract_node_disp(odb, step_name, instance_name, node_label, comp):
+    inst_keys = odb.rootAssembly.instances.keys()
+    if instance_name not in inst_keys:
+        raise KeyError('Instance "%s" not found. Available: %s' % (instance_name, list(inst_keys)))
+    step = odb.steps[step_name]
+    disp = {}
+    for fr in step.frames:
+        t = round(fr.frameValue, ROUND_T)
+        U = fr.fieldOutputs['U'].getSubset(position=NODAL)
+        for v in U.values:
+            if v.nodeLabel == node_label:
+                if comp == 'U1':
+                    val = v.data[0]
+                elif comp == 'U2':
+                    val = v.data[1]
+                else:
+                    val = v.data[2]
+                disp[t] = abs(val)  # absolute value requested
+                break
+    ts = sorted(disp.keys())
+    return ts, [disp[t] for t in ts]
+
+def align_on_common_time(t1, y1, t2, y2):
+    a = dict(zip(t1, y1)); b = dict(zip(t2, y2))
+    common = sorted(set(a.keys()).intersection(b.keys()))
+    return [a[t] for t in common], [b[t] for t in common], common
+
+def make_curve_and_png(name, x_vals, y_vals, png_path):
+    xy = xyPlot.XYData(name=name, data=tuple(zip(x_vals, y_vals)))
+    plot = session.XYPlot(name='Plot_' + name)
+    chart = list(plot.charts.values())[0]
+    curve = xyPlot.Curve(xyData=xy)
+    chart.setValues(curvesToPlot=(curve,))
+    vp = session.Viewport(name='VP_' + name, origin=(0, 0), width=200, height=120)
+    vp.setValues(displayedObject=plot)
+    session.printToFile(fileName=png_path, format=PNG, canvasObjects=(vp,))
+
+csv_dir = os.path.join(odb_directory, csv_subfolder)
+png_dir = os.path.join(odb_directory, png_subfolder)
+for d in (csv_dir, png_dir):
+    if not os.path.isdir(d):
+        os.makedirs(d)
+
+for i in range(1, num_odb_files + 1):
+    odb_name = "Output_%d.odb" % i
+    odb_path = os.path.join(odb_directory, odb_name)
+    if not os.path.isfile(odb_path):
+        print("Missing %s, skipping." % odb_name)
+        continue
+
+    print("Processing %s" % odb_name)
+    odb = openOdb(odb_path, readOnly=True)
+
+    try:
+        tF, F = extract_total_reaction(odb, step_name, RF_COMPONENTS)
+    except KeyError:
+        print("  Step '%s' not found; skipping." % step_name)
+        odb.close(); continue
+    if not F:
+        print("  No reaction data; skipping.")
+        odb.close(); continue
+
+    try:
+        tU, Uabs = extract_node_disp(odb, step_name, INSTANCE_NAME, NODE_LABEL, DISP_COMPONENT)
+    except Exception as e:
+        print("  Displacement extraction failed: %s" % e)
+        odb.close(); continue
+    if not Uabs:
+        print("  No displacement data; skipping.")
+        odb.close(); continue
+
+    # Align by time (internal only), then export just abs(U2) and Force
+    X, Y, _ = align_on_common_time(tU, Uabs, tF, F)
+    if not X:
+        print("  No common time stamps; skipping.")
+        odb.close(); continue
+
+    # CSV with two columns: abs(U2), Force
+    csv_path = os.path.join(csv_dir, "F_vs_absU_Output_%d.csv" % i)
+    with open_csv(csv_path) as f:
+        w = csv.writer(f, lineterminator='\n')
+        w.writerow(['abs(%s) (m)' % DISP_COMPONENT, 'Force (N)'])
+        for x, y in zip(X, Y):
+            w.writerow([x, y])
+
+    # Plot PNG (Force vs abs(U2))
+    png_path = os.path.join(png_dir, "F_vs_absU_Output_%d" % i)
+    make_curve_and_png("F_vs_absU_%d" % i, X, Y, png_path)
+
+    odb.close()
+
+print("Done.")
