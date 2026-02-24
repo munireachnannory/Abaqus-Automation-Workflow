@@ -1,0 +1,109 @@
+
+import os, re, time, subprocess
+# ---------------------------
+# Config
+# ---------------------------
+inp_directory       = r"D:\2024-2025 Thin Film Scan Spherical\Spherical ML Thin Film Modeling\6th Hard + Soft Properties Mix\New ML Spherical 580 depth 500nm update 8-12-2025\Bulk\modified_inp_files (32)"
+max_concurrent_jobs = 10         # change to 4, 10, etc.
+rename_max_retries  = 5
+retry_sleep_secs    = 1
+num_cpus_per_job    = 1          # keep light to avoid token/RAM issues
+# ---------------------------
+# Helpers
+# ---------------------------
+def extract_modified_number(file_name):
+    m = re.search(r'Modified_(\d+)', file_name)
+    if m: return int(m.group(1))
+    nums = re.findall(r'\d+', file_name)
+    return int(nums[-1]) if nums else 0
+def desired_odb_for(inp_file):
+    base = os.path.splitext(os.path.basename(inp_file))[0]
+    return os.path.join(inp_directory, base + ".odb")
+def uniquify_path(path):
+    base, ext = os.path.splitext(path)
+    k, new = 1, path
+    while os.path.exists(new):
+        new = "%s_(%d)%s" % (base, k, ext)
+        k += 1
+    return new
+def job_completed_successfully(job_name):
+    log_path = os.path.join(inp_directory, job_name + ".log")
+    if not os.path.exists(log_path):
+        return False
+    try:
+        with open(log_path, 'rb') as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            read_size = min(4096, size)
+            f.seek(-read_size, os.SEEK_END)
+            tail = f.read().decode('utf-8', 'ignore')
+        return ("Abaqus JOB %s COMPLETED" % job_name) in tail or \
+               ("THE ANALYSIS HAS COMPLETED SUCCESSFULLY" in tail)
+    except:
+        return False
+# ---------------------------
+# Collect inputs
+# ---------------------------
+inp_files = [f for f in os.listdir(inp_directory) if f.lower().endswith(".inp")]
+inp_files.sort(key=extract_modified_number)
+total_inps = len(inp_files)
+print "Found %d INP files in: %s" % (total_inps, inp_directory)
+# Ensure outputs land where we look
+os.chdir(inp_directory)
+# ---------------------------
+# Rolling window scheduler
+# ---------------------------
+active = []  # list of tuples: (proc, job_name, inp_file, target_odb)
+job_index = 1
+next_idx  = 0
+while next_idx < total_inps or active:
+    # Top up to max_concurrent_jobs
+    while len(active) < max_concurrent_jobs and next_idx < total_inps:
+        inp_file   = inp_files[next_idx]
+        target_odb = desired_odb_for(inp_file)
+        # Resume-safety: skip if target already exists
+        if os.path.exists(target_odb):
+            print "Skipping %s (already have %s)" % (inp_file, os.path.basename(target_odb))
+            next_idx += 1
+            continue
+        job_name = "Job_%d" % job_index
+        inp_path = os.path.join(inp_directory, inp_file)
+        try:
+            print "Submitting %s from %s" % (job_name, inp_file)
+            # Launch via command line to bypass CAE's simultaneous-analyses limit
+            # Use shell=True on Windows so "abaqus" (a .bat) resolves.
+            cmd = 'abaqus job=%s input="%s" cpus=%d interactive' % (job_name, inp_file, num_cpus_per_job)
+            p = subprocess.Popen(cmd, shell=True, cwd=inp_directory)
+            active.append((p, job_name, inp_file, target_odb))
+            job_index += 1
+            next_idx  += 1
+        except Exception as e:
+            print "ERROR: could not submit %s (%s). Skipping." % (inp_file, e)
+            next_idx += 1
+    # Wait for the oldest job to finish, then post-process it
+    p, job_name, inp_file, target_odb = active[0]
+    print "Waiting for %s to finish..." % job_name
+    rc = p.wait()
+    original_odb = os.path.join(inp_directory, job_name + ".odb")
+    # Basic success check
+    ok = (rc == 0) and job_completed_successfully(job_name)
+    if not ok:
+        print "WARNING: %s may not have completed successfully (rc=%s). Leaving files as-is." % (job_name, rc)
+    else:
+        if not os.path.exists(original_odb):
+            print "Warning: ODB not found for %s: %s" % (job_name, original_odb)
+        else:
+            final_odb = target_odb if not os.path.exists(target_odb) else uniquify_path(target_odb)
+            for attempt in range(1, rename_max_retries + 1):
+                try:
+                    os.rename(original_odb, final_odb)
+                    print "Renamed %s -> %s" % (os.path.basename(original_odb), os.path.basename(final_odb))
+                    break
+                except OSError as e:
+                    print "  attempt %d: rename failed (%s); retrying in %ds..." % (attempt, e, retry_sleep_secs)
+                    time.sleep(retry_sleep_secs)
+            else:
+                print "ERROR: could not rename %s after %d attempts." % (original_odb, rename_max_retries)
+    # Free one slot
+    active.pop(0)
+print "All %d INP files processed (submitted/skipped)." % total_inps
